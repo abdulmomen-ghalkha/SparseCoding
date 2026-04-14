@@ -4,16 +4,40 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.linear_model import Lasso
 
 
+def update_atom(k, X, D, R):
+    idx = np.where(R[k, :] != 0)[0]
+    if len(idx) == 0:
+        return None, None, k
+
+    # Compute residual without atom k
+    R_except = R.copy()
+    R_except[k, :] = 0
+
+    E = X[:, idx] - D @ R_except[:, idx]
+
+    # SVD
+    U, S, Vt = np.linalg.svd(E, full_matrices=False)
+
+    new_atom = U[:, 0]
+    new_coeffs = S[0] * Vt[0, :]
+
+    return new_atom, new_coeffs, k
+
+
+
 X_emb = np.load("./data/" + "mnist_embeddings.npy")
+X_emb=X_emb.T[:, :500]
 y = np.load("./data/" + "mnist_labels.npy")
 
 print("Loaded embeddings:", X_emb.shape)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+print(device)
 
 class SparseCodingModel(nn.Module):
     def __init__(self, d, n_atoms):
@@ -30,21 +54,19 @@ class SparseCodingModel(nn.Module):
 # 3. FIXED DICTIONARY + LASSO
 # ======================================================
 
-d = X_emb.shape[1]
+d = X_emb.shape[0]
 n_atoms = 256
+N = X_emb.shape[1]
 
 D_fixed = np.random.randn(d, n_atoms)
 D_fixed /= np.linalg.norm(D_fixed, axis=0, keepdims=True)
 
-def sparse_code_lasso(X, D, alpha=0.05):
-    codes = []
-    for x in X[:500]:
-        lasso = Lasso(alpha=alpha, fit_intercept=False, max_iter=1000)
-        lasso.fit(D, x)
-        codes.append(lasso.coef_)
-    return np.array(codes)
+model = Lasso(alpha=0.1)
 
-R_lasso = sparse_code_lasso(X_emb, D_fixed)
+model.fit(X=D_fixed, y=X_emb)
+
+R_lasso = model.coef_.T
+D_lasso = D_fixed.copy()
 print("LASSO codes:", R_lasso.shape)
 
 
@@ -55,8 +77,9 @@ model_lasso = SparseCodingModel(d, n_atoms).to(device)
 optimizer_D = optim.Adam(model_lasso.parameters(), lr=1e-3)
 lr_R = 1e-3
 
-X_torch = torch.tensor(X_emb[:1000], dtype=torch.float32).to(device)
-R_llasso = torch.randn(n_atoms, 1000, requires_grad=True, device=device)
+
+X_torch = torch.tensor(X_emb, dtype=torch.float32).to(device)
+R_llasso = torch.randn(n_atoms, N, requires_grad=True, device=device)
 
 
 
@@ -67,15 +90,16 @@ def soft_threshold(z, alpha):
 for epoch in range(100):
     # --- Step 1: Update R (Sparse Coding) ---
     # We do a few "inner" iterations of ISTA
-    for _ in range(5):
-        recon = model_lasso.D @ R_llasso
-        grad_R = model_lasso.D.T @ (recon - X_torch.T)
-        R_llasso = soft_threshold(R_llasso - lr_R * grad_R, 0.01)
+    with torch.no_grad():
+        for _ in range(5):
+            recon = model_lasso.D @ R_llasso
+            grad_R = model_lasso.D.T @ (X_torch - recon)
+            R_llasso = soft_threshold(R_llasso - lr_R * grad_R, 0.01)
 
     # --- Step 2: Update D (Dictionary Update) ---
     optimizer_D.zero_grad()
     recon = model_lasso.D @ R_llasso.detach() # Fix R
-    loss_D = ((recon.T - X_torch) ** 2).mean()
+    loss_D = ((X_torch - recon) ** 2).mean()
     loss_D.backward()
     optimizer_D.step()
 
@@ -88,25 +112,37 @@ print(model_lasso.D.shape, R_llasso.shape)
 # 4. K-SVD STYLE
 # ======================================================
 
-def ksvd_update(X, D, R, n_iter=3):
-    for _ in range(n_iter):
-        R = np.linalg.pinv(D) @ X.T
+def ksvd_update(X, D, R, n_iter=3, n_threads=8):
+    d, N = X.shape
+    K = D.shape[1]
+
+    for it in range(n_iter):
+        print("Iteration:", it)
+
+        # Sparse coding
+        R = np.linalg.pinv(D) @ X
         R[np.abs(R) < 0.1] = 0
 
-        for k in range(D.shape[1]):
-            idx = np.where(R[k, :] != 0)[0]
-            if len(idx) == 0:
-                continue
+        # Parallel dictionary update
+        with ThreadPoolExecutor(max_workers=n_threads) as executor:
+            futures = [
+                executor.submit(update_atom, k, X, D, R)
+                for k in range(K)
+            ]
 
-            E = X[idx].T - D @ R[:, idx] + np.outer(D[:, k], R[k, idx])
-            U, S, Vt = np.linalg.svd(E, full_matrices=False)
-            D[:, k] = U[:, 0]
-            R[k, idx] = S[0] * Vt[0, :]
+            for f in futures:
+                new_atom, new_coeffs, k = f.result()
+                if new_atom is None:
+                    continue
+                D[:, k] = new_atom
+                idx = np.where(R[k, :] != 0)[0]
+                R[k, idx] = new_coeffs
 
     return D, R
 
-R_init = np.random.randn(n_atoms, X_emb.shape[0])
-D_ksvd, R_ksvd = ksvd_update(X_emb[:1000], D_fixed.copy(), R_init)
+R_init = np.random.randn(n_atoms, N)
+D_ksvd, R_ksvd = ksvd_update(X_emb, D_fixed.copy(), R_init)
+print(f"Shape for KSVD: {D_ksvd.shape}, {R_ksvd.shape}")
 print("K-SVD done")
 
 # ======================================================
@@ -117,14 +153,14 @@ print("K-SVD done")
 model_sgd = SparseCodingModel(d, n_atoms).to(device)
 optimizer = optim.Adam(model_sgd.parameters(), lr=1e-3)
 
-X_torch = torch.tensor(X_emb[:1000], dtype=torch.float32).to(device)
-R = torch.randn(n_atoms, 1000, requires_grad=True, device=device)
+X_torch = torch.tensor(X_emb, dtype=torch.float32).to(device)
+R = torch.randn(n_atoms, N, requires_grad=True, device=device)
 
 for epoch in range(30):
     optimizer.zero_grad()
 
     recon = model_sgd(R)
-    loss = ((recon.T - X_torch) ** 2).mean() + 0.1 * torch.norm(R, 1)
+    loss = ((X_torch - recon) ** 2).mean() + 0.1 * torch.norm(R, 1)
 
     loss.backward()
     optimizer.step()
@@ -142,13 +178,14 @@ for epoch in range(30):
 def lagrange_dictionary_update(X, R, lambdas):
     RRt = R @ R.T
     Lambda = np.diag(lambdas)
+    print(RRt.shape, Lambda.shape)
     inv = np.linalg.inv(RRt + Lambda)
-    D = (X.T @ R.T) @ inv
-    return D.T
+    D = (X @ R.T) @ inv
+    return D
 
 lambdas = np.ones(n_atoms) * 0.1
-R_sample = R_lasso.T
-D_lagrange = lagrange_dictionary_update(X_emb[:500], R_sample, lambdas)
+R_sample = R_lasso.copy()
+D_lagrange = lagrange_dictionary_update(X_emb, R_sample, lambdas)
 
 print("Lagrange dictionary shape:", D_lagrange.shape)
 
@@ -173,7 +210,7 @@ def compute_metrics(X, D, R, name=""):
     R: (N, n_atoms)
     """
     # Reconstruction
-    X_hat = R @ D.T  # (N, d)
+    X_hat = D @ R  # (N, d)
 
     # Reconstruction error per sample
     
@@ -214,8 +251,8 @@ errors_lasso, sparsity_lasso = compute_metrics(
 
 errors_llasso, sparsity_llasso = compute_metrics(
     X_emb[:500],
-    model_lasso.D,
-    R_llasso,
+    model_lasso.D.detach().cpu().numpy(),
+    R_llasso.cpu().numpy(),
     name="Learned LASSO"
 )
 
@@ -224,12 +261,12 @@ errors_llasso, sparsity_llasso = compute_metrics(
 # ======================================================
 
 # R_ksvd is (n_atoms, N) → transpose
-R_ksvd_T = R_ksvd.T
+R_ksvd_T = R_ksvd
 
 errors_ksvd, sparsity_ksvd = compute_metrics(
     X_emb[:1000],
     D_ksvd,
-    R_ksvd_T,
+    R_ksvd,
     name="K-SVD"
 )
 
@@ -240,7 +277,8 @@ errors_ksvd, sparsity_ksvd = compute_metrics(
 
 with torch.no_grad():
     D_sgd = model_sgd.D.cpu().numpy()
-    R_sgd = R.detach().cpu().numpy().T  # (N, n_atoms)
+    R_sgd = R.detach().cpu().numpy()  # (N, n_atoms)
+
 
 errors_sgd, sparsity_sgd = compute_metrics(
     X_emb[:1000],
