@@ -14,12 +14,24 @@ print("Loaded embeddings:", X_emb.shape)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+class SparseCodingModel(nn.Module):
+    def __init__(self, d, n_atoms):
+        super().__init__()
+        self.D = nn.Parameter(torch.randn(d, n_atoms))
+
+    def forward(self, R):
+        return self.D @ R
+
+
+
+
 # ======================================================
 # 3. FIXED DICTIONARY + LASSO
 # ======================================================
 
 d = X_emb.shape[1]
-n_atoms = 128
+n_atoms = 256
 
 D_fixed = np.random.randn(d, n_atoms)
 D_fixed /= np.linalg.norm(D_fixed, axis=0, keepdims=True)
@@ -35,6 +47,43 @@ def sparse_code_lasso(X, D, alpha=0.05):
 R_lasso = sparse_code_lasso(X_emb, D_fixed)
 print("LASSO codes:", R_lasso.shape)
 
+
+# ======================================================
+# 3.b Learned DICTIONARY + LASSO
+# ======================================================
+model_lasso = SparseCodingModel(d, n_atoms).to(device)
+optimizer_D = optim.Adam(model_lasso.parameters(), lr=1e-3)
+lr_R = 1e-3
+
+X_torch = torch.tensor(X_emb[:1000], dtype=torch.float32).to(device)
+R_llasso = torch.randn(n_atoms, 1000, requires_grad=True, device=device)
+
+
+
+def soft_threshold(z, alpha):
+    return torch.sign(z) * torch.relu(torch.abs(z) - alpha)
+
+# Joint Training Loop
+for epoch in range(100):
+    # --- Step 1: Update R (Sparse Coding) ---
+    # We do a few "inner" iterations of ISTA
+    for _ in range(5):
+        recon = model_lasso.D @ R_llasso
+        grad_R = model_lasso.D.T @ (recon - X_torch.T)
+        R_llasso = soft_threshold(R_llasso - lr_R * grad_R, 0.01)
+
+    # --- Step 2: Update D (Dictionary Update) ---
+    optimizer_D.zero_grad()
+    recon = model_lasso.D @ R_llasso.detach() # Fix R
+    loss_D = ((recon.T - X_torch) ** 2).mean()
+    loss_D.backward()
+    optimizer_D.step()
+
+    # --- Step 3: Constrain D ---
+    with torch.no_grad():
+        model_lasso.D /= model_lasso.D.norm(dim=0, keepdim=True)
+        
+print(model_lasso.D.shape, R_llasso.shape)
 # ======================================================
 # 4. K-SVD STYLE
 # ======================================================
@@ -64,21 +113,14 @@ print("K-SVD done")
 # 5. SGD-BASED DICTIONARY LEARNING
 # ======================================================
 
-class SparseCodingModel(nn.Module):
-    def __init__(self, d, n_atoms):
-        super().__init__()
-        self.D = nn.Parameter(torch.randn(d, n_atoms))
-
-    def forward(self, R):
-        return self.D @ R
 
 model_sgd = SparseCodingModel(d, n_atoms).to(device)
-optimizer = optim.Adam(model_sgd.parameters(), lr=1e-1)
+optimizer = optim.Adam(model_sgd.parameters(), lr=1e-3)
 
 X_torch = torch.tensor(X_emb[:1000], dtype=torch.float32).to(device)
 R = torch.randn(n_atoms, 1000, requires_grad=True, device=device)
 
-for epoch in range(200):
+for epoch in range(30):
     optimizer.zero_grad()
 
     recon = model_sgd(R)
@@ -114,6 +156,9 @@ print("Lagrange dictionary shape:", D_lagrange.shape)
 # DONE
 # ======================================================
 print("Pipeline: Supervised encoder -> embeddings -> sparse coding")
+
+
+
 
 
 
@@ -167,6 +212,13 @@ errors_lasso, sparsity_lasso = compute_metrics(
 )
 
 
+errors_llasso, sparsity_llasso = compute_metrics(
+    X_emb[:500],
+    model_lasso.D,
+    R_llasso,
+    name="Learned LASSO"
+)
+
 # ======================================================
 # K-SVD EVALUATION
 # ======================================================
@@ -217,6 +269,7 @@ errors_lagrange, sparsity_lagrange = compute_metrics(
 
 print("\n========= SUMMARY =========")
 print(f"LASSO     | Error: {errors_lasso.mean():.4f} | Sparsity: {sparsity_lasso.mean():.2f}")
+print(f"Learned LASSO     | Error: {errors_llasso.mean():.4f} | Sparsity: {sparsity_llasso.mean():.2f}")
 print(f"K-SVD     | Error: {errors_ksvd.mean():.4f} | Sparsity: {sparsity_ksvd.mean():.2f}")
 print(f"SGD       | Error: {errors_sgd.mean():.4f} | Sparsity: {sparsity_sgd.mean():.2f}")
 print(f"LAGRANGE  | Error: {errors_lagrange.mean():.4f} | Sparsity: {sparsity_lagrange.mean():.2f}")
