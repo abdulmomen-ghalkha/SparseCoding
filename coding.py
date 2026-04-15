@@ -2,312 +2,194 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-from concurrent.futures import ThreadPoolExecutor
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Lasso, OrthogonalMatchingPursuit
 
+# ======================================================
+# 1. LOAD DATA
+# ======================================================
 
-def update_atom(k, X, D, R):
-    idx = np.where(R[k, :] != 0)[0]
-    if len(idx) == 0:
-        return None, None, k
+X_emb = np.load("./data/mnist_embeddings.npy")  # (N, d)
+X_emb = X_emb[:2000].T  # -> (d, N)
 
-    # Compute residual without atom k
-    R_except = R.copy()
-    R_except[k, :] = 0
+d, N = X_emb.shape
+n_atoms = 256
 
-    E = X[:, idx] - D @ R_except[:, idx]
+print("Data shape:", X_emb.shape)
 
-    # SVD
-    U, S, Vt = np.linalg.svd(E, full_matrices=False)
+# ======================================================
+# 2. INITIAL DICTIONARY
+# ======================================================
 
-    new_atom = U[:, 0]
-    new_coeffs = S[0] * Vt[0, :]
+def normalize_columns(D):
+    return D / (np.linalg.norm(D, axis=0, keepdims=True) + 1e-8)
 
-    return new_atom, new_coeffs, k
+D_init = normalize_columns(np.random.randn(d, n_atoms))
 
+# ======================================================
+# 3. LASSO SPARSE CODING (CORRECT)
+# ======================================================
 
+def compute_lasso_codes(D, X, alpha=0.1):
+    K = D.shape[1]
+    N = X.shape[1]
+    R = np.zeros((K, N))
 
-X_emb = np.load("./data/" + "mnist_embeddings.npy")
-X_emb=X_emb.T[:, :500]
-y = np.load("./data/" + "mnist_labels.npy")
+    for i in range(N):
+        model = Lasso(alpha=alpha, fit_intercept=False, max_iter=1000)
+        model.fit(D, X[:, i])
+        R[:, i] = model.coef_
 
-print("Loaded embeddings:", X_emb.shape)
+    return R
+
+R_lasso = compute_lasso_codes(D_init, X_emb)
+D_lasso = D_init.copy()
+
+# ======================================================
+# 4. LEARNED DICTIONARY (ISTA + SGD)
+# ======================================================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(device)
-
 class SparseCodingModel(nn.Module):
-    def __init__(self, d, n_atoms):
+    def __init__(self, d, K):
         super().__init__()
-        self.D = nn.Parameter(torch.randn(d, n_atoms))
+        self.D = nn.Parameter(torch.randn(d, K))
 
     def forward(self, R):
         return self.D @ R
 
-
-
-
-# ======================================================
-# 3. FIXED DICTIONARY + LASSO
-# ======================================================
-
-d = X_emb.shape[0]
-n_atoms = 256
-N = X_emb.shape[1]
-
-D_fixed = np.random.randn(d, n_atoms)
-D_fixed /= np.linalg.norm(D_fixed, axis=0, keepdims=True)
-
-model = Lasso(alpha=0.1)
-
-model.fit(X=D_fixed, y=X_emb)
-
-R_lasso = model.coef_.T
-D_lasso = D_fixed.copy()
-print("LASSO codes:", R_lasso.shape)
-
-
-# ======================================================
-# 3.b Learned DICTIONARY + LASSO
-# ======================================================
-model_lasso = SparseCodingModel(d, n_atoms).to(device)
-optimizer_D = optim.Adam(model_lasso.parameters(), lr=1e-3)
-lr_R = 1e-3
-
-
-X_torch = torch.tensor(X_emb, dtype=torch.float32).to(device)
-R_llasso = torch.randn(n_atoms, N, requires_grad=True, device=device)
-
-
-
 def soft_threshold(z, alpha):
     return torch.sign(z) * torch.relu(torch.abs(z) - alpha)
 
-# Joint Training Loop
-for epoch in range(100):
-    # --- Step 1: Update R (Sparse Coding) ---
-    # We do a few "inner" iterations of ISTA
-    with torch.no_grad():
-        for _ in range(5):
-            recon = model_lasso.D @ R_llasso
-            grad_R = model_lasso.D.T @ (X_torch - recon)
-            R_llasso = soft_threshold(R_llasso - lr_R * grad_R, 0.01)
-
-    # --- Step 2: Update D (Dictionary Update) ---
-    optimizer_D.zero_grad()
-    recon = model_lasso.D @ R_llasso.detach() # Fix R
-    loss_D = ((X_torch - recon) ** 2).mean()
-    loss_D.backward()
-    optimizer_D.step()
-
-    # --- Step 3: Constrain D ---
-    with torch.no_grad():
-        model_lasso.D /= model_lasso.D.norm(dim=0, keepdim=True)
-        
-print(model_lasso.D.shape, R_llasso.shape)
-# ======================================================
-# 4. K-SVD STYLE
-# ======================================================
-
-def ksvd_update(X, D, R, n_iter=3, n_threads=8):
-    d, N = X.shape
-    K = D.shape[1]
-
-    for it in range(n_iter):
-        print("Iteration:", it)
-
-        # Sparse coding
-        R = np.linalg.pinv(D) @ X
-        R[np.abs(R) < 0.1] = 0
-
-        # Parallel dictionary update
-        with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = [
-                executor.submit(update_atom, k, X, D, R)
-                for k in range(K)
-            ]
-
-            for f in futures:
-                new_atom, new_coeffs, k = f.result()
-                if new_atom is None:
-                    continue
-                D[:, k] = new_atom
-                idx = np.where(R[k, :] != 0)[0]
-                R[k, idx] = new_coeffs
-
-    return D, R
-
-R_init = np.random.randn(n_atoms, N)
-D_ksvd, R_ksvd = ksvd_update(X_emb, D_fixed.copy(), R_init)
-print(f"Shape for KSVD: {D_ksvd.shape}, {R_ksvd.shape}")
-print("K-SVD done")
-
-# ======================================================
-# 5. SGD-BASED DICTIONARY LEARNING
-# ======================================================
-
-
-model_sgd = SparseCodingModel(d, n_atoms).to(device)
-optimizer = optim.Adam(model_sgd.parameters(), lr=1e-3)
+model = SparseCodingModel(d, n_atoms).to(device)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 X_torch = torch.tensor(X_emb, dtype=torch.float32).to(device)
-R = torch.randn(n_atoms, N, requires_grad=True, device=device)
+R = torch.randn(n_atoms, N, device=device)
 
-for epoch in range(30):
+lr_R = 1e-3
+
+for epoch in range(500):
+
+    # --- ISTA update for R ---
+    with torch.no_grad():
+        for _ in range(20):
+            recon = model.D @ R
+            grad_R = - model.D.T @ (X_torch - recon)  # FIXED SIGN
+            R = soft_threshold(R - lr_R * grad_R, 0.1)
+
+    # --- Update D ---
     optimizer.zero_grad()
-
-    recon = model_sgd(R)
-    loss = ((X_torch - recon) ** 2).mean() + 0.1 * torch.norm(R, 1)
-
+    recon = model.D @ R.detach()
+    loss = ((X_torch - recon) ** 2).mean()
     loss.backward()
     optimizer.step()
 
+    # Normalize D
     with torch.no_grad():
-        model_sgd.D /= model_sgd.D.norm(dim=0, keepdim=True)
+        model.D[:] = model.D / (model.D.norm(dim=0, keepdim=True) + 1e-8)
 
     if epoch % 10 == 0:
-        print(f"SGD Epoch {epoch}, Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+
+D_learned = model.D.detach().cpu().numpy()
+R_learned = R.detach().cpu().numpy()
 
 # ======================================================
-# 6. LAGRANGE MULTIPLIER METHOD
+# 5. K-SVD (CORRECT VERSION)
+# ======================================================
+
+def ksvd(X, D, n_iter=5, sparsity=64):
+    d, N = X.shape
+    K = D.shape[1]
+
+    omp = OrthogonalMatchingPursuit(n_nonzero_coefs=sparsity)
+
+    for it in range(n_iter):
+        print(f"K-SVD Iteration {it}")
+
+        # --- Sparse coding (OMP) ---
+        R = np.zeros((K, N))
+        for i in range(N):
+            omp.fit(D, X[:, i])
+            R[:, i] = omp.coef_
+
+        # --- Dictionary update ---
+        for k in range(K):
+            idx = np.where(R[k, :] != 0)[0]
+            if len(idx) == 0:
+                continue
+
+            Rk = R.copy()
+            Rk[k, :] = 0
+
+            E = X[:, idx] - D @ Rk[:, idx]
+
+            U, S, Vt = np.linalg.svd(E, full_matrices=False)
+
+            D[:, k] = U[:, 0]
+            R[k, idx] = S[0] * Vt[0, :]
+
+        D = normalize_columns(D)
+
+    return D, R
+
+D_ksvd, R_ksvd = ksvd(X_emb, D_init.copy())
+
+# ======================================================
+# 6. LAGRANGE DICTIONARY UPDATE
 # ======================================================
 
 def lagrange_dictionary_update(X, R, lambdas):
     RRt = R @ R.T
     Lambda = np.diag(lambdas)
-    print(RRt.shape, Lambda.shape)
-    inv = np.linalg.inv(RRt + Lambda)
+
+    inv = np.linalg.pinv(RRt + Lambda)  # more stable
     D = (X @ R.T) @ inv
-    return D
+
+    return normalize_columns(D)
 
 lambdas = np.ones(n_atoms) * 0.1
-R_sample = R_lasso.copy()
-D_lagrange = lagrange_dictionary_update(X_emb, R_sample, lambdas)
-
-print("Lagrange dictionary shape:", D_lagrange.shape)
+D_lagrange = lagrange_dictionary_update(X_emb, R_lasso, lambdas)
 
 # ======================================================
-# DONE
-# ======================================================
-print("Pipeline: Supervised encoder -> embeddings -> sparse coding")
-
-
-
-
-
-
-# ======================================================
-# 7. EVALUATION METRICS
+# 7. METRICS (FIXED)
 # ======================================================
 
 def compute_metrics(X, D, R, name=""):
-    """
-    X: (N, d)
-    D: (d, n_atoms)
-    R: (N, n_atoms)
-    """
-    # Reconstruction
-    X_hat = D @ R  # (N, d)
+    X_hat = D @ R  # (d, N)
 
-    # Reconstruction error per sample
-    
-    
     errors = (
-        np.linalg.norm(X - X_hat, axis=1) /
-        np.linalg.norm(X, axis=1)
+        np.linalg.norm(X - X_hat, axis=0) /
+        np.linalg.norm(X, axis=0)
     ) * 100
 
-
-    # Sparsity (L0)
-    sparsity = np.sum(np.abs(R) > 1e-4, axis=1)
-
-    # Sparsity ratio
+    sparsity = np.sum(np.abs(R) > 1e-4, axis=0)
     sparsity_ratio = np.mean(np.abs(R) > 1e-4)
 
     print(f"\n===== {name} =====")
-    print(f"Avg reconstruction error: {errors.mean():.4f}")
-    print(f"Std reconstruction error: {errors.std():.4f}")
-    print(f"Avg sparsity (#nonzeros): {sparsity.mean():.2f}")
-    print(f"Min/Max sparsity: {sparsity.min()} / {sparsity.max()}")
+    print(f"Avg error: {errors.mean():.4f}")
+    print(f"Std error: {errors.std():.4f}")
+    print(f"Avg sparsity: {sparsity.mean():.2f}")
     print(f"Sparsity ratio: {sparsity_ratio:.4f}")
 
     return errors, sparsity
 
-
 # ======================================================
-# LASSO EVALUATION
-# ======================================================
-
-errors_lasso, sparsity_lasso = compute_metrics(
-    X_emb[:500],
-    D_fixed,
-    R_lasso,
-    name="LASSO"
-)
-
-
-errors_llasso, sparsity_llasso = compute_metrics(
-    X_emb[:500],
-    model_lasso.D.detach().cpu().numpy(),
-    R_llasso.cpu().numpy(),
-    name="Learned LASSO"
-)
-
-# ======================================================
-# K-SVD EVALUATION
+# 8. EVALUATION
 # ======================================================
 
-# R_ksvd is (n_atoms, N) → transpose
-R_ksvd_T = R_ksvd
-
-errors_ksvd, sparsity_ksvd = compute_metrics(
-    X_emb[:1000],
-    D_ksvd,
-    R_ksvd,
-    name="K-SVD"
-)
-
+errors_lasso, _ = compute_metrics(X_emb, D_lasso, R_lasso, "LASSO")
+errors_learned, _ = compute_metrics(X_emb, D_learned, R_learned, "LEARNED")
+errors_ksvd, _ = compute_metrics(X_emb, D_ksvd, R_ksvd, "K-SVD")
+errors_lagrange, _ = compute_metrics(X_emb, D_lagrange, R_lasso, "LAGRANGE")
 
 # ======================================================
-# SGD EVALUATION
+# 9. SUMMARY
 # ======================================================
 
-with torch.no_grad():
-    D_sgd = model_sgd.D.cpu().numpy()
-    R_sgd = R.detach().cpu().numpy()  # (N, n_atoms)
-
-
-errors_sgd, sparsity_sgd = compute_metrics(
-    X_emb[:1000],
-    D_sgd,
-    R_sgd,
-    name="SGD"
-)
-
-
-# ======================================================
-# LAGRANGE EVALUATION
-# ======================================================
-
-# Uses LASSO codes with new dictionary
-errors_lagrange, sparsity_lagrange = compute_metrics(
-    X_emb[:500],
-    D_lagrange,
-    R_lasso,
-    name="LAGRANGE"
-)
-
-
-# ======================================================
-# SUMMARY TABLE
-# ======================================================
-
-print("\n========= SUMMARY =========")
-print(f"LASSO     | Error: {errors_lasso.mean():.4f} | Sparsity: {sparsity_lasso.mean():.2f}")
-print(f"Learned LASSO     | Error: {errors_llasso.mean():.4f} | Sparsity: {sparsity_llasso.mean():.2f}")
-print(f"K-SVD     | Error: {errors_ksvd.mean():.4f} | Sparsity: {sparsity_ksvd.mean():.2f}")
-print(f"SGD       | Error: {errors_sgd.mean():.4f} | Sparsity: {sparsity_sgd.mean():.2f}")
-print(f"LAGRANGE  | Error: {errors_lagrange.mean():.4f} | Sparsity: {sparsity_lagrange.mean():.2f}")
+print("\n===== SUMMARY =====")
+print(f"LASSO     : {errors_lasso.mean():.4f}")
+print(f"LEARNED   : {errors_learned.mean():.4f}")
+print(f"K-SVD     : {errors_ksvd.mean():.4f}")
+print(f"LAGRANGE  : {errors_lagrange.mean():.4f}")
