@@ -837,3 +837,184 @@ class MultiUserSheafFixedDict:
     # =====================================================
     def transform(self, X):
         return self.admm_sparse_coding(X)
+    
+
+
+
+## -------------------------------------------------
+
+
+import torch
+
+# =========================================================
+# Helpers
+# =========================================================
+def normalize_columns(D):
+    return D / (torch.norm(D, dim=0, keepdim=True) + 1e-8)
+
+
+def hard_group_topk(S, k):
+    row_norms = torch.norm(S, dim=1)
+    idx = torch.topk(row_norms, k=k).indices
+
+    Z = torch.zeros_like(S)
+    Z[idx] = S[idx]
+    return Z
+
+
+# =========================================================
+# Single-user SCA (NO inner ADMM loops)
+# =========================================================
+class SingleUserSCADict:
+
+    def __init__(self, d, K, k_sparsity, rho=1.0, alpha=1.0, gamma=0.5, beta=0.5, device=None):
+
+        self.d = d
+        self.K = K
+        self.k = k_sparsity
+        self.rho = rho
+        self.alpha = alpha
+        self.gamma = gamma
+        self.beta = beta
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize variables
+        D = torch.randn(d, K, device=self.device)
+        self.D = normalize_columns(D)
+
+        self.P = self.D.clone()
+        self.U = torch.zeros_like(self.D)
+
+    # =====================================================
+    # S update (one-shot, from closed form)
+    # =====================================================
+    def update_S(self, X, S, Z, V):
+
+        DtD = self.D.T @ self.D
+        DtX = self.D.T @ X
+
+        Q = DtD + self.rho * torch.eye(self.K, device=self.device)
+        R = DtX + self.rho * (Z - V) # Possible error (transpose)
+
+        Q_inv = torch.linalg.inv(Q + 1e-8 * torch.eye(self.K, device=self.device))
+        S_tilde = Q_inv @ R
+
+        # SCA smoothing
+        S_new = S + self.alpha * (S_tilde - S)
+
+        return S_new
+
+    # =====================================================
+    # Z update (projection)
+    # =====================================================
+    def update_Z(self, S, V):
+        return hard_group_topk(S + V, self.k)
+
+    # =====================================================
+    # D update (from Eq. DA = B)
+    # =====================================================
+    def update_D(self, X, S):
+
+        SS_T = S @ S.T
+        A = SS_T + self.rho * torch.eye(self.K, device=self.device)
+
+        B = X @ S.T + self.rho * (self.P - self.U)
+
+        A_inv = torch.linalg.inv(A + 1e-8 * torch.eye(self.K, device=self.device))
+        D_tilde = B @ A_inv
+
+        # SCA smoothing
+        D_new = self.D + self.alpha * (D_tilde - self.D)
+
+        return D_new
+
+    # =====================================================
+    # P update (projection onto OB)
+    # =====================================================
+    def update_P(self, D):
+
+        H = D + self.U
+        return normalize_columns(H)
+
+    # =====================================================
+    # Dual updates
+    # =====================================================
+    def update_duals(self, D, P, S, Z, V):
+
+        self.U = self.U + D - P
+        V = V + S - Z
+
+        return V
+    
+
+    def update_alpha(self, iter, alpha, gamma, beta):
+        gamma = gamma
+        beta = iter * beta
+        alpha = (alpha * gamma) / (1 + beta)
+        return alpha, gamma, beta
+    # =====================================================
+    # Training loop
+    # =====================================================
+    def fit(self, X, outer_iters=20):
+
+        X = X.to(self.device)
+        d, n = X.shape
+
+        # Initialize S, Z, V
+        S = torch.zeros(self.K, n, device=self.device)
+        Z = torch.zeros_like(S)
+        V = torch.zeros_like(S)
+
+        losses = []
+
+        for t in range(1, outer_iters):
+
+            # ---- S update
+            S_new = self.update_S(X, S, Z, V)
+
+            # ---- D update
+            D_new = self.update_D(X, S)
+            S = S_new
+            self.D = D_new
+
+
+            # ---- Z update
+            Z = self.update_Z(S, V)
+
+
+            # ---- P update
+            P_new = self.update_P(D_new)
+
+            # ---- dual updates
+            V = self.update_duals(D_new, P_new, S, Z, V)
+
+            # assign updates
+            self.P = P_new
+            # ---- loss
+            recon = torch.norm(X - self.D @ S, p='fro')
+            losses.append(recon.item())
+
+            print(f"iter {t}: loss={recon.item():.6f}")
+
+            self.alpha, self.gamma, self.beta = self.update_alpha(t, self.alpha, self.gamma, self.beta)
+            print(self.alpha,self.gamma, self.beta)
+        S = hard_group_topk(S, self.k)
+        return self.D, S, losses
+
+    # =====================================================
+    # Transform
+    # =====================================================
+    def transform(self, X):
+
+        X = X.to(self.device)
+
+        S = torch.zeros(self.K, X.shape[1], device=self.device)
+        Z = torch.zeros_like(S)
+        V = torch.zeros_like(S)
+
+        for _ in range(10):
+            S = self.update_S(X, S, Z, V)
+            Z = self.update_Z(S, V)
+            V = V + S - Z
+
+        return Z
