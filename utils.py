@@ -1018,3 +1018,541 @@ class SingleUserSCADict:
             V = V + S - Z
 
         return Z
+    
+
+
+# =========================================================
+# Multi-user SCA Dictionary Learning (FIXED)
+# =========================================================
+class MultiUserSCADict:
+
+    def __init__(self, d, K, k_sparsity, edges, mu=0.1,
+                 rho=1.0, alpha=1.0, gamma=0.5, beta=0.5, num_fp_iters=10, tol=1e-4, gamma_D=1e-2, device=None):
+
+        self.d = d
+        self.K = K
+        self.k = k_sparsity
+        self.edges = edges
+        self.mu = mu
+        self.rho = rho
+        self.alpha = alpha
+        self.gamma = gamma
+        self.beta = beta
+        self.num_fp_iters = num_fp_iters
+        self.tol = tol
+        self.gamma_D = gamma_D
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ---- shared dictionary
+        D = torch.randn(d, K, device=self.device)
+        self.D = normalize_columns(D)
+
+        self.P = self.D.clone()
+        self.U = torch.zeros_like(self.D)
+
+        # ---- initialize O_uv
+        self.O = {(u, v): torch.eye(d, device=self.device) for (u, v) in edges}
+
+    # =====================================================
+    # S update (CORRECT SCA + sheaf + ADMM form)
+    # =====================================================
+    def update_S(self, i, X_dict, S_dict, Z_dict, V_dict):
+
+        X_i = X_dict[i]
+        S_i = S_dict[i]
+        Z_i = Z_dict[i]
+        V_i = V_dict[i]
+
+        DtD = self.D.T @ self.D
+        DtX = self.D.T @ X_i
+
+        # degree
+        delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
+
+        Q = (1 + 2 * self.mu * delta_i) * DtD + self.rho * torch.eye(self.K, device=self.device)
+
+        R = DtX + self.rho * (Z_i - V_i)
+
+        # ---- sheaf terms (CORRECT)
+        #for (u, v) in self.edges:
+        #    if u == i:
+        #        R += 2 * self.mu * self.D.T @ self.O[(u, v)].T @ self.D @ S_dict[v]
+        #    elif v == i:
+        #        R += 2 * self.mu * self.D.T @ self.O[(u, v)] @ self.D @ S_dict[u]
+
+        Q_inv = torch.linalg.inv(Q + 1e-8 * torch.eye(self.K, device=self.device))
+        S_tilde = Q_inv @ R
+
+        return S_i + self.alpha * (S_tilde - S_i)
+
+    # =====================================================
+    # D update (FIXED-POINT + EARLY STOPPING)
+    # =====================================================
+    def update_D(self, X_dict, S_dict, num_fp_iters=10, tol=1e-4):
+
+        # ---- build A
+        A = torch.zeros((self.K, self.K), device=self.device)
+
+        for i in X_dict:
+            S = S_dict[i]
+            A += S @ S.T
+
+        for (u, v) in self.edges:
+            A += 2 * self.mu * (S_dict[u] @ S_dict[u].T + S_dict[v] @ S_dict[v].T)
+
+        A += self.rho * torch.eye(self.K, device=self.device)
+
+        # ---- build B
+        B = torch.zeros((self.d, self.K), device=self.device)
+
+        for i in X_dict:
+            B += X_dict[i] @ S_dict[i].T
+
+        B += self.rho * (self.P - self.U) + 2 * self.gamma_D * self.D @ torch.linalg.inv(self.D.T @ self.D)
+
+        A_inv = torch.linalg.inv(A + 1e-8 * torch.eye(self.K, device=self.device))
+
+        # ---- FIXED-POINT ITERATION
+        D_fp = self.D.clone()
+
+        for k in range(num_fp_iters):
+
+            D_prev = D_fp.clone()
+
+            sheaf_term = torch.zeros_like(D_fp)
+
+            for (u, v) in self.edges:
+                Su = S_dict[u]
+                Sv = S_dict[v]
+                # Can be precomputed to acceleraed the training
+                sheaf_term += (
+                    self.O[(u, v)].T @ D_fp @ Sv @ Su.T +
+                    self.O[(u, v)] @ D_fp @ Su @ Sv.T
+                )
+
+            # ---- update
+            #D_fp = (B + 2 * self.mu * 0 * sheaf_term) @ A_inv
+            D_fp = B @ A_inv
+            # ---- convergence check
+            diff = torch.norm(D_fp - D_prev, p='fro')
+            #print(diff)
+            if diff < tol:
+                # optional debug
+                print(f"D fixed-point converged at iter {k}, diff={diff.item():.6e}")
+                break
+
+        # ---- SCA smoothing
+        D_new = self.D + self.alpha * (D_fp - self.D)
+
+        return D_new
+
+    # =====================================================
+    # O update (Procrustes)
+    # =====================================================
+    def update_O(self, S_dict):
+
+        for (u, v) in self.edges:
+
+            A = self.D @ S_dict[u]
+            B = self.D @ S_dict[v]
+
+            M = B @ A.T
+            U, _, Vt = torch.linalg.svd(M)
+
+            self.O[(u, v)] = U @ Vt
+
+    # =====================================================
+    # Z update (GROUP SPARSITY on S^T)
+    # =====================================================
+    def update_Z(self, S, V):
+        return hard_group_topk(S + V, self.k)
+
+    # =====================================================
+    # P update
+    # =====================================================
+    def update_P(self, D):
+        return normalize_columns(D + self.U)
+
+    # =====================================================
+    # Dual updates (FIXED TRANSPOSE)
+    # =====================================================
+    def update_duals(self, D, P, S_dict, Z_dict, V_dict):
+
+        self.U = self.U + D - P
+
+        for i in S_dict:
+            V_dict[i] = V_dict[i] + S_dict[i] - Z_dict[i]
+
+        return V_dict
+
+    # =====================================================
+    # Step-size schedule
+    # =====================================================
+    def update_alpha(self, t):
+        self.beta = t * self.beta
+        self.alpha = (self.alpha * self.gamma) / (1 + self.beta)
+
+    # =====================================================
+    # Training loop (torch.no_grad)
+    # =====================================================
+    def fit(self, X_dict, outer_iters=20):
+
+        X_dict = {i: X.to(self.device) for i, X in X_dict.items()}
+
+        # ---- initialize
+        S_dict = {i: torch.zeros(self.K, X.shape[1], device=self.device) for i, X in X_dict.items()}
+        S_dict_new = {i: torch.zeros(self.K, X.shape[1], device=self.device) for i, X in X_dict.items()}
+        Z_dict = {i: torch.zeros_like(S_dict[i]) for i in X_dict}
+        V_dict = {i: torch.zeros_like(S_dict[i]) for i in X_dict}
+
+        losses = []
+
+        for t in range(1, outer_iters):
+
+            with torch.no_grad():
+
+                # ---- S updates
+                for i in X_dict:
+                    S_dict_new[i] = self.update_S(i, X_dict, S_dict, Z_dict, V_dict)
+
+                # ---- D update
+                D_new = self.update_D(X_dict, S_dict, num_fp_iters=self.num_fp_iters, tol=self.tol)
+
+                for i in X_dict:
+                    S_dict[i] = S_dict_new[i].detach().clone()
+                
+                # ---- O updates
+                #self.update_O(S_dict)
+
+                # ---- Z updates
+                for i in X_dict:
+                    Z_dict[i] = self.update_Z(S_dict[i], V_dict[i])
+
+                # ---- P update
+                P_new = self.update_P(D_new)
+
+                # ---- dual updates
+                V_dict = self.update_duals(D_new, P_new, S_dict, Z_dict, V_dict)
+
+                # assign
+                self.D = D_new
+                self.P = P_new
+
+                # ---- loss
+                loss = 0
+                for i in X_dict:
+                    loss += torch.norm(X_dict[i] - self.D @ S_dict[i], p='fro')**2
+
+                for (u, v) in self.edges:
+                    loss += 0 * self.mu * torch.norm(
+                        self.O[(u, v)] @ self.D @ S_dict[u] - self.D @ S_dict[v], p='fro'
+                    )**2
+
+                losses.append(loss.item())
+
+                print(f"iter {t}: loss={loss.item():.6f}")
+
+                # step size update
+                self.update_alpha(t)
+        self.update_O(S_dict)
+        for i in S_dict:
+            S_dict[i] = hard_group_topk(S_dict[i], self.k)
+        return self.D, S_dict, losses
+
+
+
+
+# =========================================================
+# Multi-user Sheaf SCA Dictionary Learning (FULL MODEL)
+# =========================================================
+class MultiUserSheafSCADict:
+
+    def __init__(self, d, K, k_sparsity, edges, mu=0.1,
+                 rho=1.0, alpha=1.0, gamma=0.5, beta=0.5, num_fp_iters=10, tol=1e-4, device=None):
+
+        self.d = d
+        self.K = K
+        self.k = k_sparsity
+        self.edges = edges
+        self.mu = mu
+        self.rho = rho
+        self.alpha = alpha
+        self.gamma = gamma
+        self.beta = beta
+        self.num_fp_iters = num_fp_iters
+        self.tol = tol
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ---- shared dictionary
+        D = torch.randn(d, K, device=self.device)
+        self.D = normalize_columns(D)
+
+        self.P = self.D.clone()
+        self.U = torch.zeros_like(self.D)
+
+        # ---- initialize O_uv
+        self.O = {(u, v): torch.eye(d, device=self.device) for (u, v) in edges}
+
+    # =====================================================
+    # S update (CORRECT SCA + sheaf + ADMM form)
+    # =====================================================
+    def update_S(self, i, X_dict, S_dict, Z_dict, V_dict):
+
+        X_i = X_dict[i]
+        S_i = S_dict[i]
+        Z_i = Z_dict[i]
+        V_i = V_dict[i]
+
+        DtD = self.D.T @ self.D
+        DtX = self.D.T @ X_i
+
+        # degree
+        delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
+
+        Q = (1 + 2 * self.mu * delta_i) * DtD + self.rho * torch.eye(self.K, device=self.device)
+
+        R = DtX + self.rho * (Z_i - V_i)
+
+        # ---- sheaf terms (CORRECT)
+        for (u, v) in self.edges:
+            if u == i:
+                R += 2 * self.mu * self.D.T @ self.O[(u, v)].T @ self.D @ S_dict[v]
+            elif v == i:
+                R += 2 * self.mu * self.D.T @ self.O[(u, v)] @ self.D @ S_dict[u]
+
+        Q_inv = torch.linalg.inv(Q + 1e-8 * torch.eye(self.K, device=self.device))
+        S_tilde = Q_inv @ R
+
+        return S_i + self.alpha * (S_tilde - S_i)
+
+    # =====================================================
+    # D update (FIXED-POINT + EARLY STOPPING)
+    # =====================================================
+    def update_D(self, X_dict, S_dict, num_fp_iters=10, tol=1e-4):
+
+        # ---- build A
+        A = torch.zeros((self.K, self.K), device=self.device)
+
+        for i in X_dict:
+            S = S_dict[i]
+            A += S @ S.T
+
+        for (u, v) in self.edges:
+            A += 2 * self.mu * (S_dict[u] @ S_dict[u].T + S_dict[v] @ S_dict[v].T)
+
+        A += self.rho * torch.eye(self.K, device=self.device)
+
+        # ---- build B
+        B = torch.zeros((self.d, self.K), device=self.device)
+
+        for i in X_dict:
+            B += X_dict[i] @ S_dict[i].T
+
+        B += self.rho * (self.P - self.U)
+
+        A_inv = torch.linalg.inv(A + 1e-8 * torch.eye(self.K, device=self.device))
+
+        # ---- FIXED-POINT ITERATION
+        D_fp = self.D.clone()
+
+        for k in range(num_fp_iters):
+
+            D_prev = D_fp.clone()
+
+            sheaf_term = torch.zeros_like(D_fp)
+
+            for (u, v) in self.edges:
+                Su = S_dict[u]
+                Sv = S_dict[v]
+                # Can be precomputed to acceleraed the training
+                sheaf_term += (
+                    self.O[(u, v)].T @ D_fp @ Sv @ Su.T +
+                    self.O[(u, v)] @ D_fp @ Su @ Sv.T
+                )
+
+            # ---- update
+            D_fp = (B + 2 * self.mu * sheaf_term) @ A_inv
+            #D_fp = B @ A_inv
+            # ---- convergence check
+            diff = torch.norm(D_fp - D_prev, p='fro')
+            #print(diff)
+            if diff < tol:
+                # optional debug
+                print(f"D fixed-point converged at iter {k}, diff={diff.item():.6e}")
+                break
+
+        # ---- SCA smoothing
+        D_new = self.D + self.alpha * (D_fp - self.D)
+
+        return D_new
+
+    # =====================================================
+    # O update (Procrustes)
+    # =====================================================
+    def update_O(self, S_dict):
+
+        for (u, v) in self.edges:
+
+            A = self.D @ S_dict[u]
+            B = self.D @ S_dict[v]
+
+            M = B @ A.T
+            U, _, Vt = torch.linalg.svd(M)
+
+            self.O[(u, v)] = U @ Vt
+
+    # =====================================================
+    # Z update (GROUP SPARSITY on S^T)
+    # =====================================================
+    def update_Z(self, S, V):
+        return hard_group_topk(S + V, self.k)
+
+    # =====================================================
+    # P update
+    # =====================================================
+    def update_P(self, D):
+        return normalize_columns(D + self.U)
+
+    # =====================================================
+    # Dual updates (FIXED TRANSPOSE)
+    # =====================================================
+    def update_duals(self, D, P, S_dict, Z_dict, V_dict):
+
+        self.U = self.U + D - P
+
+        for i in S_dict:
+            V_dict[i] = V_dict[i] + S_dict[i] - Z_dict[i]
+
+        return V_dict
+
+    # =====================================================
+    # Step-size schedule
+    # =====================================================
+    def update_alpha(self, t):
+        self.beta = t * self.beta
+        self.alpha = (self.alpha * self.gamma) / (1 + self.beta)
+
+    # =====================================================
+    # Training loop (torch.no_grad)
+    # =====================================================
+    def fit(self, X_dict, outer_iters=20):
+
+        X_dict = {i: X.to(self.device) for i, X in X_dict.items()}
+
+        # ---- initialize
+        S_dict = {i: torch.zeros(self.K, X.shape[1], device=self.device) for i, X in X_dict.items()}
+        S_dict_new = {i: torch.zeros(self.K, X.shape[1], device=self.device) for i, X in X_dict.items()}
+        Z_dict = {i: torch.zeros_like(S_dict[i]) for i in X_dict}
+        V_dict = {i: torch.zeros_like(S_dict[i]) for i in X_dict}
+
+        losses = []
+
+        for t in range(1, outer_iters):
+
+            with torch.no_grad():
+
+                # ---- S updates
+                for i in X_dict:
+                    S_dict_new[i] = self.update_S(i, X_dict, S_dict, Z_dict, V_dict)
+
+                # ---- D update
+                D_new = self.update_D(X_dict, S_dict, num_fp_iters=self.num_fp_iters, tol=self.tol)
+
+                for i in X_dict:
+                    S_dict[i] = S_dict_new[i].detach().clone()
+                
+                # ---- O updates
+                self.update_O(S_dict)
+
+                # ---- Z updates
+                for i in X_dict:
+                    Z_dict[i] = self.update_Z(S_dict[i], V_dict[i])
+
+                # ---- P update
+                P_new = self.update_P(D_new)
+
+                # ---- dual updates
+                V_dict = self.update_duals(D_new, P_new, S_dict, Z_dict, V_dict)
+
+                # assign
+                self.D = D_new
+                self.P = P_new
+
+                # ---- loss
+                loss = 0
+                for i in X_dict:
+                    loss += torch.norm(X_dict[i] - self.D @ S_dict[i], p='fro')**2
+
+                for (u, v) in self.edges:
+                    loss += self.mu * torch.norm(
+                        self.O[(u, v)] @ self.D @ S_dict[u] - self.D @ S_dict[v], p='fro'
+                    )**2
+
+                losses.append(loss.item())
+
+                print(f"iter {t}: loss={loss.item():.6f}")
+
+                # step size update
+                self.update_alpha(t)
+        self.update_O(S_dict)
+        for i in S_dict:
+            S_dict[i] = hard_group_topk(S_dict[i], self.k)
+        return self.D, S_dict, losses
+
+
+
+
+def compute_sheaf_loss(model, S_dict, X_dict=None, device=None, verbose=True):
+    """
+    Compute sheaf consistency loss and per-edge errors.
+
+    Args:
+        model: trained MultiUserSCADict
+        S_dict: dict of sparse codes {i: S_i}
+        X_dict: (optional) dict of data, only used for device alignment
+        device: torch device
+        verbose: print per-edge errors
+
+    Returns:
+        sheaf_loss (tensor), edge_errors (dict)
+    """
+
+    device = device or model.device
+    sheaf_loss = torch.tensor(0.0, device=device)
+
+    edge_errors = {}
+
+    with torch.no_grad():
+
+        for (u, v) in model.edges:
+
+            S_u = S_dict[u].to(device)
+            S_v = S_dict[v].to(device)
+
+            O_uv = model.O[(u, v)]
+
+            # Reconstructions
+            DSu = model.D @ S_u
+            DSv = model.D @ S_v
+
+            # Sheaf residual
+            diff = O_uv @ DSu - DSv
+
+            edge_loss = torch.norm(diff, p='fro')**2
+            sheaf_loss += edge_loss
+
+            # relative error (%)
+            denom = torch.norm(DSv, p='fro')**2 + 1e-8
+            percentage_error = (edge_loss / denom) * 100
+
+            edge_errors[(u, v)] = percentage_error.item()
+
+            if verbose:
+                print(f"Edge {(u, v)}: error = {percentage_error.item():.4f}%")
+
+    if verbose:
+        print(f"Total Sheaf loss: {sheaf_loss.item():.4f}")
+
+    return sheaf_loss, edge_errors
