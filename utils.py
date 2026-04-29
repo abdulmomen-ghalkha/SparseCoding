@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+from collections import defaultdict 
 
 # =========================================================
 # Utilities
@@ -1053,6 +1053,13 @@ class MultiUserSCADict:
 
         # ---- initialize O_uv
         self.O = {(u, v): torch.eye(d, device=self.device) for (u, v) in edges}
+        
+        self.neighbors = defaultdict(list)
+        for (u, v) in self.edges:
+            self.neighbors[u].append(v)
+            self.neighbors[v].append(u)
+
+        self.degrees = {i: len(self.neighbors[i]) for i in self.neighbors}
 
     # =====================================================
     # S update (CORRECT SCA + sheaf + ADMM form)
@@ -1068,9 +1075,9 @@ class MultiUserSCADict:
         DtX = self.D.T @ X_i
 
         # degree
-        delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
+        #delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
 
-        Q = (1 + 2 * self.mu * delta_i) * DtD + self.rho * torch.eye(self.K, device=self.device)
+        Q = (1 + 2 * self.mu * self.degrees[i]) * DtD + self.rho * torch.eye(self.K, device=self.device)
 
         R = DtX + self.rho * (Z_i - V_i)
 
@@ -1151,11 +1158,12 @@ class MultiUserSCADict:
     # O update (Procrustes)
     # =====================================================
     def update_O(self, S_dict):
+        DS_dict = {i: self.D @ S_dict[i] for i in S_dict}
 
         for (u, v) in self.edges:
 
-            A = self.D @ S_dict[u]
-            B = self.D @ S_dict[v]
+            A = DS_dict[u] #self.D @ S_dict[u]
+            B = DS_dict[v] #self.D @ S_dict[v]
 
             M = B @ A.T
             U, _, Vt = torch.linalg.svd(M)
@@ -1295,6 +1303,12 @@ class MultiUserSheafSCADict:
         # ---- initialize O_uv
         self.O = {(u, v): torch.eye(d, device=self.device) for (u, v) in edges}
 
+        self.neighbors = defaultdict(list)
+        for (u, v) in self.edges:
+            self.neighbors[u].append(v)
+            self.neighbors[v].append(u)
+
+        self.degrees = {i: len(self.neighbors[i]) for i in self.neighbors}
     # =====================================================
     # S update (CORRECT SCA + sheaf + ADMM form)
     # =====================================================
@@ -1309,9 +1323,9 @@ class MultiUserSheafSCADict:
         DtX = self.D.T @ X_i
 
         # degree
-        delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
+        #delta_i = sum([1 for (u, v) in self.edges if u == i or v == i])
 
-        Q = (1 + 2 * self.mu * delta_i) * DtD + self.rho * torch.eye(self.K, device=self.device)
+        Q = (1 + 2 * self.mu * self.degrees[i]) * DtD + self.rho * torch.eye(self.K, device=self.device)
 
         R = DtX + self.rho * (Z_i - V_i)
 
@@ -1362,14 +1376,14 @@ class MultiUserSheafSCADict:
             D_prev = D_fp.clone()
 
             sheaf_term = torch.zeros_like(D_fp)
-
+            DS_dict = {i: D_fp @ S_dict[i] for i in S_dict}
             for (u, v) in self.edges:
                 Su = S_dict[u]
                 Sv = S_dict[v]
                 # Can be precomputed to acceleraed the training
                 sheaf_term += (
-                    self.O[(u, v)].T @ D_fp @ Sv @ Su.T +
-                    self.O[(u, v)] @ D_fp @ Su @ Sv.T
+                    self.O[(u, v)].T @ DS_dict[v] @ Su.T +
+                    self.O[(u, v)] @ DS_dict[u] @ Sv.T
                 )
 
             # ---- update
@@ -1393,10 +1407,12 @@ class MultiUserSheafSCADict:
     # =====================================================
     def update_O(self, S_dict):
 
+        DS_dict = {i: self.D @ S_dict[i] for i in S_dict}
+
         for (u, v) in self.edges:
 
-            A = self.D @ S_dict[u]
-            B = self.D @ S_dict[v]
+            A = DS_dict[u] #self.D @ S_dict[u]
+            B = DS_dict[v] #self.D @ S_dict[v]
 
             M = B @ A.T
             U, _, Vt = torch.linalg.svd(M)
